@@ -196,3 +196,23 @@ def decide_leave(leave_id:int,decision:str,request:Request):
                         (decision,user["id"],leave_id))
             if not cur.fetchone(): raise HTTPException(404,"Pending request not found")
     return {"ok":True}
+
+class ResetEmployeePassword(BaseModel):
+    employee_number: str
+    new_password: str
+
+@router.post("/employees/reset-password")
+def reset_employee_password(data:ResetEmployeePassword,request:Request):
+    session_user(request,{"admin"})
+    if not data.employee_number.isdigit() or len(data.employee_number)>40:
+        raise HTTPException(422,"Invalid employee number")
+    new_hash=hash_password(data.new_password)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM hr_users WHERE employee_number=%s AND role='employee' FOR UPDATE",(data.employee_number,))
+            row=cur.fetchone()
+            if not row:
+                raise HTTPException(404,"Employee account not found")
+            cur.execute("UPDATE hr_users SET password_hash=%s WHERE id=%s",(new_hash,row[0]))
+            cur.execute("DELETE FROM hr_sessions WHERE user_id=%s",(row[0],))
+    return {"ok":True}
