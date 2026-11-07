@@ -4,6 +4,8 @@ import hmac
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse
 from pathlib import Path
+from backend.auth import router as auth_router, init_db
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import psycopg
 
@@ -52,3 +54,22 @@ def employees(x_admin_token: str | None = Header(default=None)):
 @app.get("/directory", include_in_schema=False)
 def directory():
     return FileResponse(Path(__file__).with_name("directory.html"), headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
+
+app.include_router(auth_router)
+
+@app.middleware("http")
+async def reject_cross_origin_writes(request, call_next):
+    if request.url.path.startswith("/api/") and request.method in {"POST","PUT","PATCH","DELETE"}:
+        origin = request.headers.get("origin")
+        expected = str(request.base_url).rstrip("/")
+        if origin and origin != expected:
+            return JSONResponse({"detail":"Cross-origin writes forbidden"},status_code=403)
+    return await call_next(request)
+
+@app.on_event("startup")
+def initialize_accounts():
+    init_db()
+
+@app.get("/login",include_in_schema=False)
+def login_page():
+    return FileResponse(Path(__file__).with_name("portal.html"),headers={"Cache-Control":"no-store"})
