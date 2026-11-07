@@ -93,7 +93,7 @@ class Login(BaseModel):
 def login(data:Login,response:Response):
     with db() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id,password_hash FROM hr_users WHERE email=%s AND active=TRUE",(data.email.strip().lower(),))
+            cur.execute("SELECT id,password_hash FROM hr_users WHERE (email=%s OR (employee_number=%s AND role='employee')) AND active=TRUE",(data.email.strip().lower(),data.email.strip()))
             user=cur.fetchone()
             if not user or not verify(data.password,user[1]):
                 raise HTTPException(401,"Invalid credentials")
@@ -117,7 +117,7 @@ def me(request:Request):
     return session_user(request)
 
 class NewUser(BaseModel):
-    email: str
+    email: str = ""
     password: str
     role: str
     employee_number: str | None = None
@@ -129,10 +129,15 @@ def create_user(data:NewUser,request:Request):
         raise HTTPException(422,"Invalid role")
     if data.role=="employee" and not data.employee_number:
         raise HTTPException(422,"Employee number required")
+    if data.role!="employee" and not data.email.strip():
+        raise HTTPException(422,"Email required for staff roles")
+    if data.role=="employee" and (not data.employee_number.isdigit() or len(data.employee_number)>40):
+        raise HTTPException(422,"Employee number must contain digits only")
+    login_email = ("employee-"+data.employee_number+"@accounts.invalid") if data.role=="employee" else data.email.strip().lower()
     try:
         with db() as conn:
             conn.execute("INSERT INTO hr_users(email,password_hash,role,employee_number) VALUES (%s,%s,%s,%s)",
-                         (data.email.strip().lower(),hash_password(data.password),data.role,data.employee_number or None))
+                         (login_email,hash_password(data.password),data.role,data.employee_number or None))
     except psycopg.errors.UniqueViolation:
         raise HTTPException(409,"Email or employee account already exists")
     except psycopg.errors.ForeignKeyViolation:
