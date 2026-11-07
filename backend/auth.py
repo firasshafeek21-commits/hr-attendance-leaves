@@ -331,26 +331,35 @@ def monthly_attendance_report(request:Request,month:str):
     start=date(year,month_number,1)
     end=date(year,month_number,calendar.monthrange(year,month_number)[1])
     with db() as conn:
-        employees=conn.execute("SELECT employee_number,full_name FROM employees ORDER BY employee_number").fetchall()
-        records=conn.execute("""SELECT employee_number,work_date,check_in,check_out
-            FROM hr_attendance WHERE work_date BETWEEN %s AND %s
-            ORDER BY work_date,employee_number""",(start,end)).fetchall()
+        employees=conn.execute("""SELECT employee_number,full_name FROM employees
+            WHERE employee_number ~ '^[0-9]+$' ORDER BY employee_number""").fetchall()
+        records=conn.execute("""SELECT a.employee_number,a.work_date,a.check_in,a.check_out
+            FROM hr_attendance a JOIN employees e ON e.employee_number=a.employee_number
+            WHERE a.work_date BETWEEN %s AND %s AND e.employee_number ~ '^[0-9]+$'
+            ORDER BY a.work_date,a.employee_number""",(start,end)).fetchall()
     totals={number:{"employee_number":number,"name":name,"days_present":0,
-        "days_late":0,"late_minutes":0,"worked_minutes":0} for number,name in employees}
+        "days_late":0,"late_minutes":0,"early_departure_minutes":0,
+        "worked_seconds":0} for number,name in employees}
     details=[]
     for number,day,check_in,check_out in records:
         local_in=check_in.astimezone(IRAQ_TZ)
         local_out=check_out.astimezone(IRAQ_TZ) if check_out else None
-        late=max(0,local_in.hour*60+local_in.minute-510)
-        worked=max(0,int((check_out-check_in).total_seconds()//60)) if check_out else None
+        start_time=datetime.combine(day,datetime.min.time(),IRAQ_TZ)+timedelta(hours=8,minutes=30)
+        end_time=datetime.combine(day,datetime.min.time(),IRAQ_TZ)+timedelta(hours=19,minutes=30)
+        late=max(0,int((local_in-start_time).total_seconds()//60))
+        early=max(0,int((end_time-local_out).total_seconds()//60)) if local_out else None
+        worked=max(0,int((check_out-check_in).total_seconds())) if check_out else None
         totals[number]["days_present"]+=1
         totals[number]["days_late"]+=int(late>0)
         totals[number]["late_minutes"]+=late
+        if early is not None:
+            totals[number]["early_departure_minutes"]+=early
         if worked is not None:
-            totals[number]["worked_minutes"]+=worked
+            totals[number]["worked_seconds"]+=worked
         details.append({"employee_number":number,"name":totals[number]["name"],
             "date":str(day),"check_in":local_in.strftime("%H:%M:%S"),
             "check_out":local_out.strftime("%H:%M:%S") if local_out else None,
-            "late_minutes":late,"worked_minutes":worked})
-    return {"month":month,"official_start":"08:30","summary":list(totals.values()),"details":details,
-            "note":"Only recorded attendance is counted; absence, holidays and approved leave are not classified."}
+            "late_minutes":late,"early_departure_minutes":early,"worked_seconds":worked})
+    return {"month":month,"official_start":"08:30","official_end":"19:30",
+        "summary":list(totals.values()),"details":details,
+        "note":"Only recorded attendance is counted; absence, holidays, breaks and approved leave are not classified."}
