@@ -60,6 +60,7 @@ def init_db():
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 CHECK(ends >= starts)
             )""")
+            cur.execute("ALTER TABLE hr_users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT FALSE")
             email=os.getenv("HR_BOOTSTRAP_EMAIL","").strip().lower()
             password=os.getenv("HR_BOOTSTRAP_PASSWORD","")
             if email and password:
@@ -75,7 +76,7 @@ def session_user(request, roles=None):
     digest=hashlib.sha256(token.encode()).hexdigest()
     with db() as conn:
         with conn.cursor() as cur:
-            cur.execute("""SELECT u.id,u.email,u.role,u.employee_number FROM hr_sessions s
+            cur.execute("""SELECT u.id,u.email,u.role,u.employee_number,u.must_change_password FROM hr_sessions s
                 JOIN hr_users u ON u.id=s.user_id
                 WHERE s.token_hash=%s AND s.expires_at>NOW() AND u.active=TRUE""",(digest,))
             user=cur.fetchone()
@@ -83,7 +84,7 @@ def session_user(request, roles=None):
         raise HTTPException(401,"Session expired")
     if roles and user[2] not in roles:
         raise HTTPException(403,"Insufficient permissions")
-    return {"id":user[0],"email":user[1],"role":user[2],"employee_number":user[3]}
+    return {"id":user[0],"email":user[1],"role":user[2],"employee_number":user[3],"must_change_password":user[4]}
 
 class Login(BaseModel):
     email: str
@@ -215,4 +216,49 @@ def reset_employee_password(data:ResetEmployeePassword,request:Request):
                 raise HTTPException(404,"Employee account not found")
             cur.execute("UPDATE hr_users SET password_hash=%s WHERE id=%s",(new_hash,row[0]))
             cur.execute("DELETE FROM hr_sessions WHERE user_id=%s",(row[0],))
+    return {"ok":True}
+
+
+@router.post("/employees/create-all-accounts")
+def create_all_employee_accounts(request:Request):
+    session_user(request,{"admin"})
+    created=[]
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT e.employee_number,e.full_name FROM employees e
+                WHERE NOT EXISTS (SELECT 1 FROM hr_users u WHERE u.employee_number=e.employee_number)
+                ORDER BY e.employee_number FOR UPDATE OF e""")
+            for number,name in cur.fetchall():
+                if not number.isdigit() or len(number)>40:
+                    continue
+                password=secrets.token_urlsafe(18)
+                cur.execute("""INSERT INTO hr_users(email,password_hash,role,employee_number,must_change_password)
+                    VALUES (%s,%s,'employee',%s,TRUE) ON CONFLICT DO NOTHING RETURNING id""",
+                    ("employee-"+number+"@accounts.invalid",hash_password(password),number))
+                if cur.fetchone():
+                    created.append({"employee_number":number,"full_name":name,"temporary_password":password})
+    return {"created_count":len(created),"credentials":created,
+            "note":"Temporary passwords are shown once. Save securely."}
+
+class ChangeOwnPassword(BaseModel):
+    current_password: str
+    new_password: str
+
+@router.post("/change-password")
+def change_own_password(data:ChangeOwnPassword,request:Request):
+    user=session_user(request)
+    new_hash=hash_password(data.new_password)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT password_hash FROM hr_users WHERE id=%s FOR UPDATE",(user["id"],))
+            row=cur.fetchone()
+            if not row or not verify(data.current_password,row[0]):
+                raise HTTPException(401,"Current password is incorrect")
+            if verify(data.new_password,row[0]):
+                raise HTTPException(422,"New password must be different")
+            cur.execute("UPDATE hr_users SET password_hash=%s,must_change_password=FALSE WHERE id=%s",
+                        (new_hash,user["id"]))
+            token=request.cookies.get("hr_session","")
+            cur.execute("DELETE FROM hr_sessions WHERE user_id=%s AND token_hash<>%s",
+                        (user["id"],hashlib.sha256(token.encode()).hexdigest()))
     return {"ok":True}
