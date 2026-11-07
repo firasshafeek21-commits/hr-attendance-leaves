@@ -339,7 +339,7 @@ def monthly_attendance_report(request:Request,month:str):
             ORDER BY a.work_date,a.employee_number""",(start,end)).fetchall()
     totals={number:{"employee_number":number,"name":name,"days_present":0,
         "days_late":0,"late_minutes":0,"early_departure_minutes":0,
-        "worked_seconds":0} for number,name in employees}
+        "worked_seconds":0,"net_worked_seconds":0} for number,name in employees}
     details=[]
     for number,day,check_in,check_out in records:
         local_in=check_in.astimezone(IRAQ_TZ)
@@ -349,6 +349,7 @@ def monthly_attendance_report(request:Request,month:str):
         late=max(0,int((local_in-start_time).total_seconds()//60))
         early=max(0,int((end_time-local_out).total_seconds()//60)) if local_out else None
         worked=max(0,int((check_out-check_in).total_seconds())) if check_out else None
+        net_worked=max(0,worked-1800) if worked is not None else None
         totals[number]["days_present"]+=1
         totals[number]["days_late"]+=int(late>0)
         totals[number]["late_minutes"]+=late
@@ -356,10 +357,12 @@ def monthly_attendance_report(request:Request,month:str):
             totals[number]["early_departure_minutes"]+=early
         if worked is not None:
             totals[number]["worked_seconds"]+=worked
+            totals[number]["net_worked_seconds"]+=net_worked
         details.append({"employee_number":number,"name":totals[number]["name"],
             "date":str(day),"check_in":local_in.strftime("%H:%M:%S"),
             "check_out":local_out.strftime("%H:%M:%S") if local_out else None,
-            "late_minutes":late,"early_departure_minutes":early,"worked_seconds":worked})
-    return {"month":month,"official_start":"08:30","official_end":"19:30",
+            "late_minutes":late,"early_departure_minutes":early,"worked_seconds":worked,
+            "net_worked_seconds":net_worked})
+    return {"month":month,"official_start":"08:30","official_end":"19:30","break_minutes":30,"scheduled_net_minutes":630,
         "summary":list(totals.values()),"details":details,
-        "note":"Only recorded attendance is counted; absence, holidays, breaks and approved leave are not classified."}
+        "note":"Only recorded attendance is counted; absence, holidays and approved leave are not classified. Net time deducts up to 30 minutes per completed attendance record."}
