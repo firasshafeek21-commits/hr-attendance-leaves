@@ -82,6 +82,8 @@ def session_user(request, roles=None):
             user=cur.fetchone()
     if not user:
         raise HTTPException(401,"Session expired")
+    if user[4] and request.url.path not in {"/api/me","/api/change-password","/api/logout"}:
+        raise HTTPException(403,"Password change required")
     if roles and user[2] not in roles:
         raise HTTPException(403,"Insufficient permissions")
     return {"id":user[0],"email":user[1],"role":user[2],"employee_number":user[3],"must_change_password":user[4]}
