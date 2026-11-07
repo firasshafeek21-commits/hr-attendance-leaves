@@ -1,6 +1,7 @@
 """Role-based HR accounts. Initial admin created only from private Render environment settings."""
 import os, secrets, hashlib, hmac
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from contextlib import contextmanager
 import psycopg
 from fastapi import APIRouter, HTTPException, Request, Response
@@ -60,6 +61,7 @@ def init_db():
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 CHECK(ends >= starts)
             )""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS hr_attendance (\n                id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,\n                employee_number TEXT NOT NULL REFERENCES employees(employee_number),\n                work_date DATE NOT NULL,\n                check_in TIMESTAMPTZ NOT NULL,\n                check_out TIMESTAMPTZ,\n                UNIQUE(employee_number,work_date),\n                CHECK(check_out IS NULL OR check_out >= check_in)\n            )""")
             cur.execute("ALTER TABLE hr_users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT FALSE")
             email=os.getenv("HR_BOOTSTRAP_EMAIL","").strip().lower()
             password=os.getenv("HR_BOOTSTRAP_PASSWORD","")
@@ -264,3 +266,50 @@ def change_own_password(data:ChangeOwnPassword,request:Request):
             cur.execute("DELETE FROM hr_sessions WHERE user_id=%s AND token_hash<>%s",
                         (user["id"],hashlib.sha256(token.encode()).hexdigest()))
     return {"ok":True}
+
+
+IRAQ_TZ=ZoneInfo("Asia/Baghdad")
+
+@router.post("/attendance/check-in")
+def attendance_check_in(request:Request):
+    user=session_user(request,{"employee"})
+    now=datetime.now(timezone.utc)
+    today=now.astimezone(IRAQ_TZ).date()
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""INSERT INTO hr_attendance(employee_number,work_date,check_in)
+                VALUES (%s,%s,%s) ON CONFLICT (employee_number,work_date) DO NOTHING RETURNING id""",
+                (user["employee_number"],today,now))
+            if not cur.fetchone():
+                raise HTTPException(409,"Attendance already recorded today")
+    return {"ok":True}
+
+@router.post("/attendance/check-out")
+def attendance_check_out(request:Request):
+    user=session_user(request,{"employee"})
+    now=datetime.now(timezone.utc)
+    today=now.astimezone(IRAQ_TZ).date()
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""UPDATE hr_attendance SET check_out=%s
+                WHERE employee_number=%s AND work_date=%s AND check_out IS NULL
+                RETURNING id""",(now,user["employee_number"],today))
+            if not cur.fetchone():
+                raise HTTPException(409,"Check in first, or check out already recorded")
+    return {"ok":True}
+
+@router.get("/attendance")
+def list_attendance(request:Request):
+    user=session_user(request,{"employee","manager","accountant","admin"})
+    sql="""SELECT a.employee_number,e.full_name,a.work_date,a.check_in,a.check_out
+        FROM hr_attendance a JOIN employees e ON e.employee_number=a.employee_number"""
+    args=()
+    if user["role"]=="employee":
+        sql+=" WHERE a.employee_number=%s"
+        args=(user["employee_number"],)
+    sql+=" ORDER BY a.work_date DESC,a.check_in DESC LIMIT 500"
+    with db() as conn:
+        rows=conn.execute(sql,args).fetchall()
+    return {"attendance":[{"employee_number":r[0],"name":r[1],"date":str(r[2]),
+        "check_in":r[3].astimezone(IRAQ_TZ).strftime("%H:%M:%S"),
+        "check_out":r[4].astimezone(IRAQ_TZ).strftime("%H:%M:%S") if r[4] else None} for r in rows]}
