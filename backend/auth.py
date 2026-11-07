@@ -313,3 +313,44 @@ def list_attendance(request:Request):
     return {"attendance":[{"employee_number":r[0],"name":r[1],"date":str(r[2]),
         "check_in":r[3].astimezone(IRAQ_TZ).strftime("%H:%M:%S"),
         "check_out":r[4].astimezone(IRAQ_TZ).strftime("%H:%M:%S") if r[4] else None} for r in rows]}
+
+
+@router.get("/attendance/monthly-report")
+def monthly_attendance_report(request:Request,month:str):
+    session_user(request,{"admin","manager","accountant"})
+    from datetime import date
+    import calendar
+    try:
+        if len(month)!=7 or month[4]!="-":
+            raise ValueError()
+        year=int(month[:4]); month_number=int(month[5:])
+        if date(year,month_number,1).strftime("%Y-%m")!=month:
+            raise ValueError()
+    except ValueError:
+        raise HTTPException(422,"Invalid month (YYYY-MM)")
+    start=date(year,month_number,1)
+    end=date(year,month_number,calendar.monthrange(year,month_number)[1])
+    with db() as conn:
+        employees=conn.execute("SELECT employee_number,full_name FROM employees ORDER BY employee_number").fetchall()
+        records=conn.execute("""SELECT employee_number,work_date,check_in,check_out
+            FROM hr_attendance WHERE work_date BETWEEN %s AND %s
+            ORDER BY work_date,employee_number""",(start,end)).fetchall()
+    totals={number:{"employee_number":number,"name":name,"days_present":0,
+        "days_late":0,"late_minutes":0,"worked_minutes":0} for number,name in employees}
+    details=[]
+    for number,day,check_in,check_out in records:
+        local_in=check_in.astimezone(IRAQ_TZ)
+        local_out=check_out.astimezone(IRAQ_TZ) if check_out else None
+        late=max(0,local_in.hour*60+local_in.minute-510)
+        worked=max(0,int((check_out-check_in).total_seconds()//60)) if check_out else None
+        totals[number]["days_present"]+=1
+        totals[number]["days_late"]+=int(late>0)
+        totals[number]["late_minutes"]+=late
+        if worked is not None:
+            totals[number]["worked_minutes"]+=worked
+        details.append({"employee_number":number,"name":totals[number]["name"],
+            "date":str(day),"check_in":local_in.strftime("%H:%M:%S"),
+            "check_out":local_out.strftime("%H:%M:%S") if local_out else None,
+            "late_minutes":late,"worked_minutes":worked})
+    return {"month":month,"official_start":"08:30","summary":list(totals.values()),"details":details,
+            "note":"Only recorded attendance is counted; absence, holidays and approved leave are not classified."}
