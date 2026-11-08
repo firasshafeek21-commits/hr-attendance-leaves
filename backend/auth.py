@@ -63,6 +63,10 @@ def init_db():
             )""")
             cur.execute("""CREATE TABLE IF NOT EXISTS hr_attendance (\n                id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,\n                employee_number TEXT NOT NULL REFERENCES employees(employee_number),\n                work_date DATE NOT NULL,\n                check_in TIMESTAMPTZ NOT NULL,\n                check_out TIMESTAMPTZ,\n                UNIQUE(employee_number,work_date),\n                CHECK(check_out IS NULL OR check_out >= check_in)\n            )""")
             cur.execute("""CREATE TABLE IF NOT EXISTS hr_holidays (\n                id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,\n                holiday_date DATE NOT NULL UNIQUE,\n                title TEXT NOT NULL,\n                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()\n            )""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS hr_employee_start_dates (
+                employee_number TEXT PRIMARY KEY REFERENCES employees(employee_number),
+                start_date DATE NOT NULL
+            )""")
             cur.execute("ALTER TABLE hr_users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT FALSE")
             email=os.getenv("HR_BOOTSTRAP_EMAIL","").strip().lower()
             password=os.getenv("HR_BOOTSTRAP_PASSWORD","")
@@ -352,6 +356,186 @@ def delete_holiday(holiday_id:int,request:Request):
         row=conn.execute("DELETE FROM hr_holidays WHERE id=%s RETURNING id",(holiday_id,)).fetchone()
     if not row:
         raise HTTPException(404,"Holiday not found")
+    return {"ok":True}
+
+
+class EmployeeStartDate(BaseModel):
+    employee_number: str
+    start_date: str
+
+@router.get("/employees/start-dates")
+def list_employee_start_dates(request:Request):
+    session_user(request,{"admin","manager","accountant"})
+    with db() as conn:
+        rows=conn.execute("""SELECT e.employee_number,e.full_name,s.start_date
+            FROM employees e LEFT JOIN hr_employee_start_dates s ON s.employee_number=e.employee_number
+            WHERE e.employee_number ~ '^[0-9]+
+def monthly_attendance_report(request:Request,month:str):
+    session_user(request,{"admin","manager","accountant"})
+    from datetime import date
+    import calendar
+    try:
+        if len(month)!=7 or month[4]!="-":
+            raise ValueError()
+        year=int(month[:4]); month_number=int(month[5:])
+        if date(year,month_number,1).strftime("%Y-%m")!=month:
+            raise ValueError()
+    except ValueError:
+        raise HTTPException(422,"Invalid month (YYYY-MM)")
+    start=date(year,month_number,1)
+    end=date(year,month_number,calendar.monthrange(year,month_number)[1])
+    with db() as conn:
+        employees=conn.execute("""SELECT employee_number,full_name FROM employees
+            WHERE employee_number ~ '^[0-9]+$' ORDER BY employee_number""").fetchall()
+        records=conn.execute("""SELECT a.employee_number,a.work_date,a.check_in,a.check_out
+            FROM hr_attendance a JOIN employees e ON e.employee_number=a.employee_number
+            WHERE a.work_date BETWEEN %s AND %s AND e.employee_number ~ '^[0-9]+$'
+            ORDER BY a.work_date,a.employee_number""",(start,end)).fetchall()
+        holidays=conn.execute("SELECT holiday_date,title FROM hr_holidays WHERE holiday_date BETWEEN %s AND %s ORDER BY holiday_date",(start,end)).fetchall()
+        start_dates=dict(conn.execute("SELECT employee_number,start_date FROM hr_employee_start_dates").fetchall())
+        approved_leaves=conn.execute("""SELECT employee_number,starts,ends FROM hr_leaves
+            WHERE status='approved' AND starts<=%s AND ends>=%s""",(end,start)).fetchall()
+    holiday_dates={day for day,_ in holidays}
+    today=datetime.now(IRAQ_TZ).date()
+    report_end=min(end,today-timedelta(days=1))
+    expected_days=sum(1 for d in range((report_end-start).days+1) if start+timedelta(days=d) not in holiday_dates) if report_end>=start else 0
+    leave_dates={}
+    for employee_number,leave_start,leave_end in approved_leaves:
+        dates=leave_dates.setdefault(employee_number,set())
+        first=max(start,leave_start)
+        last=min(end,leave_end)
+        dates.update(first+timedelta(days=i) for i in range((last-first).days+1))
+    totals={number:{"employee_number":number,"name":name,"days_present":0,
+        "days_late":0,"late_minutes":0,"early_departure_minutes":0,
+        "worked_seconds":0,"net_worked_seconds":0,"days_absent":None,"start_date":str(start_dates[number]) if number in start_dates else None,"days_approved_leave":0,"holiday_days":len(holiday_dates)} for number,name in employees}
+    details=[]
+    for number,day,check_in,check_out in records:
+        local_in=check_in.astimezone(IRAQ_TZ)
+        local_out=check_out.astimezone(IRAQ_TZ) if check_out else None
+        start_time=datetime.combine(day,datetime.min.time(),IRAQ_TZ)+timedelta(hours=8,minutes=30)
+        end_time=datetime.combine(day,datetime.min.time(),IRAQ_TZ)+timedelta(hours=19,minutes=30)
+        late=max(0,int((local_in-start_time).total_seconds()//60))
+        early=max(0,int((end_time-local_out).total_seconds()//60)) if local_out else None
+        worked=max(0,int((check_out-check_in).total_seconds())) if check_out else None
+        net_worked=max(0,worked-1800) if worked is not None else None
+        totals[number]["days_present"]+=1
+        totals[number]["days_late"]+=int(late>0)
+        totals[number]["late_minutes"]+=late
+        if early is not None:
+            totals[number]["early_departure_minutes"]+=early
+        if worked is not None:
+            totals[number]["worked_seconds"]+=worked
+            totals[number]["net_worked_seconds"]+=net_worked
+        details.append({"employee_number":number,"name":totals[number]["name"],
+            "date":str(day),"check_in":local_in.strftime("%H:%M:%S"),
+            "check_out":local_out.strftime("%H:%M:%S") if local_out else None,
+            "late_minutes":late,"early_departure_minutes":early,"worked_seconds":worked,
+            "net_worked_seconds":net_worked})
+    for item in totals.values():
+        number=item["employee_number"]
+        attended={day for n,day,_,_ in records if n==number and day<=report_end and day not in holiday_dates}
+        employment_start=start_dates.get(number)
+        covered_leave={day for day in leave_dates.get(number,set()) if day<=report_end and day not in holiday_dates and day not in attended and (employment_start is None or day>=employment_start)}
+        item["days_approved_leave"]=len(covered_leave)
+        if employment_start is not None:
+            first=max(start,employment_start)
+            applicable_days=sum(1 for i in range((report_end-first).days+1)
+                if first+timedelta(days=i) not in holiday_dates) if first<=report_end else 0
+            applicable_attended={day for day in attended if day>=first}
+            item["days_absent"]=max(0,applicable_days-len(applicable_attended)-len(covered_leave))
+    return {"holidays":[{"date":str(day),"title":title} for day,title in holidays],"month":month,"official_start":"08:30","official_end":"19:30","break_minutes":30,"scheduled_net_minutes":630,
+        "summary":list(totals.values()),"details":details,
+        "note":"Only recorded attendance is counted; Absence excludes registered holidays and today/future dates, and approved leave, and dates before employment start; absence remains uncalculated when start date is missing. Net time deducts up to 30 minutes per completed attendance record."}
+ ORDER BY e.employee_number""").fetchall()
+    return {"employees":[{"employee_number":r[0],"name":r[1],
+        "start_date":str(r[2]) if r[2] else None} for r in rows]}
+
+@router.put("/employees/start-date")
+def set_employee_start_date(data:EmployeeStartDate,request:Request):
+    session_user(request,{"admin"})
+    from datetime import date
+    try:
+        day=date.fromisoformat(data.start_date)
+        if day.isoformat()!=data.start_date:
+            raise ValueError()
+    except ValueError:
+        raise HTTPException(422,"Invalid start date")
+    with db() as conn:
+        row=conn.execute("SELECT 1 FROM employees WHERE employee_number=%s AND employee_number ~ '^[0-9]+
+def monthly_attendance_report(request:Request,month:str):
+    session_user(request,{"admin","manager","accountant"})
+    from datetime import date
+    import calendar
+    try:
+        if len(month)!=7 or month[4]!="-":
+            raise ValueError()
+        year=int(month[:4]); month_number=int(month[5:])
+        if date(year,month_number,1).strftime("%Y-%m")!=month:
+            raise ValueError()
+    except ValueError:
+        raise HTTPException(422,"Invalid month (YYYY-MM)")
+    start=date(year,month_number,1)
+    end=date(year,month_number,calendar.monthrange(year,month_number)[1])
+    with db() as conn:
+        employees=conn.execute("""SELECT employee_number,full_name FROM employees
+            WHERE employee_number ~ '^[0-9]+$' ORDER BY employee_number""").fetchall()
+        records=conn.execute("""SELECT a.employee_number,a.work_date,a.check_in,a.check_out
+            FROM hr_attendance a JOIN employees e ON e.employee_number=a.employee_number
+            WHERE a.work_date BETWEEN %s AND %s AND e.employee_number ~ '^[0-9]+$'
+            ORDER BY a.work_date,a.employee_number""",(start,end)).fetchall()
+        holidays=conn.execute("SELECT holiday_date,title FROM hr_holidays WHERE holiday_date BETWEEN %s AND %s ORDER BY holiday_date",(start,end)).fetchall()
+        approved_leaves=conn.execute("""SELECT employee_number,starts,ends FROM hr_leaves
+            WHERE status='approved' AND starts<=%s AND ends>=%s""",(end,start)).fetchall()
+    holiday_dates={day for day,_ in holidays}
+    today=datetime.now(IRAQ_TZ).date()
+    report_end=min(end,today-timedelta(days=1))
+    expected_days=sum(1 for d in range((report_end-start).days+1) if start+timedelta(days=d) not in holiday_dates) if report_end>=start else 0
+    leave_dates={}
+    for employee_number,leave_start,leave_end in approved_leaves:
+        dates=leave_dates.setdefault(employee_number,set())
+        first=max(start,leave_start)
+        last=min(end,leave_end)
+        dates.update(first+timedelta(days=i) for i in range((last-first).days+1))
+    totals={number:{"employee_number":number,"name":name,"days_present":0,
+        "days_late":0,"late_minutes":0,"early_departure_minutes":0,
+        "worked_seconds":0,"net_worked_seconds":0,"days_absent":0,"days_approved_leave":0,"holiday_days":len(holiday_dates)} for number,name in employees}
+    details=[]
+    for number,day,check_in,check_out in records:
+        local_in=check_in.astimezone(IRAQ_TZ)
+        local_out=check_out.astimezone(IRAQ_TZ) if check_out else None
+        start_time=datetime.combine(day,datetime.min.time(),IRAQ_TZ)+timedelta(hours=8,minutes=30)
+        end_time=datetime.combine(day,datetime.min.time(),IRAQ_TZ)+timedelta(hours=19,minutes=30)
+        late=max(0,int((local_in-start_time).total_seconds()//60))
+        early=max(0,int((end_time-local_out).total_seconds()//60)) if local_out else None
+        worked=max(0,int((check_out-check_in).total_seconds())) if check_out else None
+        net_worked=max(0,worked-1800) if worked is not None else None
+        totals[number]["days_present"]+=1
+        totals[number]["days_late"]+=int(late>0)
+        totals[number]["late_minutes"]+=late
+        if early is not None:
+            totals[number]["early_departure_minutes"]+=early
+        if worked is not None:
+            totals[number]["worked_seconds"]+=worked
+            totals[number]["net_worked_seconds"]+=net_worked
+        details.append({"employee_number":number,"name":totals[number]["name"],
+            "date":str(day),"check_in":local_in.strftime("%H:%M:%S"),
+            "check_out":local_out.strftime("%H:%M:%S") if local_out else None,
+            "late_minutes":late,"early_departure_minutes":early,"worked_seconds":worked,
+            "net_worked_seconds":net_worked})
+    for item in totals.values():
+        number=item["employee_number"]
+        attended={day for n,day,_,_ in records if n==number and day<=report_end and day not in holiday_dates}
+        covered_leave={day for day in leave_dates.get(number,set()) if day<=report_end and day not in holiday_dates and day not in attended}
+        item["days_approved_leave"]=len(covered_leave)
+        item["days_absent"]=max(0,expected_days-len(attended)-len(covered_leave))
+    return {"holidays":[{"date":str(day),"title":title} for day,title in holidays],"month":month,"official_start":"08:30","official_end":"19:30","break_minutes":30,"scheduled_net_minutes":630,
+        "summary":list(totals.values()),"details":details,
+        "note":"Only recorded attendance is counted; Absence excludes registered holidays and today/future dates, and approved leave, but does not yet account for pre-employment dates. Net time deducts up to 30 minutes per completed attendance record."}
+",(data.employee_number,)).fetchone()
+        if not row:
+            raise HTTPException(404,"Employee not found")
+        conn.execute("""INSERT INTO hr_employee_start_dates(employee_number,start_date) VALUES (%s,%s)
+            ON CONFLICT(employee_number) DO UPDATE SET start_date=EXCLUDED.start_date""",(data.employee_number,day))
     return {"ok":True}
 
 
