@@ -378,13 +378,21 @@ def monthly_attendance_report(request:Request,month:str):
             WHERE a.work_date BETWEEN %s AND %s AND e.employee_number ~ '^[0-9]+$'
             ORDER BY a.work_date,a.employee_number""",(start,end)).fetchall()
         holidays=conn.execute("SELECT holiday_date,title FROM hr_holidays WHERE holiday_date BETWEEN %s AND %s ORDER BY holiday_date",(start,end)).fetchall()
+        approved_leaves=conn.execute("""SELECT employee_number,starts,ends FROM hr_leaves
+            WHERE status='approved' AND starts<=%s AND ends>=%s""",(end,start)).fetchall()
     holiday_dates={day for day,_ in holidays}
     today=datetime.now(IRAQ_TZ).date()
     report_end=min(end,today-timedelta(days=1))
     expected_days=sum(1 for d in range((report_end-start).days+1) if start+timedelta(days=d) not in holiday_dates) if report_end>=start else 0
+    leave_dates={}
+    for employee_number,leave_start,leave_end in approved_leaves:
+        dates=leave_dates.setdefault(employee_number,set())
+        first=max(start,leave_start)
+        last=min(end,leave_end)
+        dates.update(first+timedelta(days=i) for i in range((last-first).days+1))
     totals={number:{"employee_number":number,"name":name,"days_present":0,
         "days_late":0,"late_minutes":0,"early_departure_minutes":0,
-        "worked_seconds":0,"net_worked_seconds":0,"days_absent":0,"holiday_days":len(holiday_dates)} for number,name in employees}
+        "worked_seconds":0,"net_worked_seconds":0,"days_absent":0,"days_approved_leave":0,"holiday_days":len(holiday_dates)} for number,name in employees}
     details=[]
     for number,day,check_in,check_out in records:
         local_in=check_in.astimezone(IRAQ_TZ)
@@ -411,7 +419,9 @@ def monthly_attendance_report(request:Request,month:str):
     for item in totals.values():
         number=item["employee_number"]
         attended={day for n,day,_,_ in records if n==number and day<=report_end and day not in holiday_dates}
-        item["days_absent"]=max(0,expected_days-len(attended))
+        covered_leave={day for day in leave_dates.get(number,set()) if day<=report_end and day not in holiday_dates and day not in attended}
+        item["days_approved_leave"]=len(covered_leave)
+        item["days_absent"]=max(0,expected_days-len(attended)-len(covered_leave))
     return {"holidays":[{"date":str(day),"title":title} for day,title in holidays],"month":month,"official_start":"08:30","official_end":"19:30","break_minutes":30,"scheduled_net_minutes":630,
         "summary":list(totals.values()),"details":details,
-        "note":"Only recorded attendance is counted; Absence excludes registered holidays and today/future dates, but does not yet exclude approved leave or pre-employment dates. Net time deducts up to 30 minutes per completed attendance record."}
+        "note":"Only recorded attendance is counted; Absence excludes registered holidays and today/future dates, and approved leave, but does not yet account for pre-employment dates. Net time deducts up to 30 minutes per completed attendance record."}
