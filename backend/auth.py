@@ -62,6 +62,7 @@ def init_db():
                 CHECK(ends >= starts)
             )""")
             cur.execute("""CREATE TABLE IF NOT EXISTS hr_attendance (\n                id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,\n                employee_number TEXT NOT NULL REFERENCES employees(employee_number),\n                work_date DATE NOT NULL,\n                check_in TIMESTAMPTZ NOT NULL,\n                check_out TIMESTAMPTZ,\n                UNIQUE(employee_number,work_date),\n                CHECK(check_out IS NULL OR check_out >= check_in)\n            )""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS hr_holidays (\n                id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,\n                holiday_date DATE NOT NULL UNIQUE,\n                title TEXT NOT NULL,\n                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()\n            )""")
             cur.execute("ALTER TABLE hr_users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT FALSE")
             email=os.getenv("HR_BOOTSTRAP_EMAIL","").strip().lower()
             password=os.getenv("HR_BOOTSTRAP_PASSWORD","")
@@ -315,6 +316,45 @@ def list_attendance(request:Request):
         "check_out":r[4].astimezone(IRAQ_TZ).strftime("%H:%M:%S") if r[4] else None} for r in rows]}
 
 
+class HolidayInput(BaseModel):
+    holiday_date: str
+    title: str = Field(min_length=2,max_length=150)
+
+@router.get("/holidays")
+def list_holidays(request:Request):
+    session_user(request,{"admin","manager","accountant"})
+    with db() as conn:
+        rows=conn.execute("SELECT id,holiday_date,title FROM hr_holidays ORDER BY holiday_date DESC").fetchall()
+    return {"holidays":[{"id":r[0],"date":str(r[1]),"title":r[2]} for r in rows]}
+
+@router.post("/holidays")
+def add_holiday(data:HolidayInput,request:Request):
+    session_user(request,{"admin"})
+    from datetime import date
+    try:
+        day=date.fromisoformat(data.holiday_date)
+        if day.isoformat()!=data.holiday_date:
+            raise ValueError()
+    except ValueError:
+        raise HTTPException(422,"Invalid holiday date")
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""INSERT INTO hr_holidays(holiday_date,title) VALUES (%s,%s)
+                ON CONFLICT(holiday_date) DO UPDATE SET title=EXCLUDED.title
+                RETURNING id""",(day,data.title.strip()))
+            holiday_id=cur.fetchone()[0]
+    return {"ok":True,"id":holiday_id}
+
+@router.delete("/holidays/{holiday_id}")
+def delete_holiday(holiday_id:int,request:Request):
+    session_user(request,{"admin"})
+    with db() as conn:
+        row=conn.execute("DELETE FROM hr_holidays WHERE id=%s RETURNING id",(holiday_id,)).fetchone()
+    if not row:
+        raise HTTPException(404,"Holiday not found")
+    return {"ok":True}
+
+
 @router.get("/attendance/monthly-report")
 def monthly_attendance_report(request:Request,month:str):
     session_user(request,{"admin","manager","accountant"})
@@ -337,9 +377,14 @@ def monthly_attendance_report(request:Request,month:str):
             FROM hr_attendance a JOIN employees e ON e.employee_number=a.employee_number
             WHERE a.work_date BETWEEN %s AND %s AND e.employee_number ~ '^[0-9]+$'
             ORDER BY a.work_date,a.employee_number""",(start,end)).fetchall()
+        holidays=conn.execute("SELECT holiday_date,title FROM hr_holidays WHERE holiday_date BETWEEN %s AND %s ORDER BY holiday_date",(start,end)).fetchall()
+    holiday_dates={day for day,_ in holidays}
+    today=datetime.now(IRAQ_TZ).date()
+    report_end=min(end,today-timedelta(days=1))
+    expected_days=sum(1 for d in range((report_end-start).days+1) if start+timedelta(days=d) not in holiday_dates) if report_end>=start else 0
     totals={number:{"employee_number":number,"name":name,"days_present":0,
         "days_late":0,"late_minutes":0,"early_departure_minutes":0,
-        "worked_seconds":0,"net_worked_seconds":0} for number,name in employees}
+        "worked_seconds":0,"net_worked_seconds":0,"days_absent":0,"holiday_days":len(holiday_dates)} for number,name in employees}
     details=[]
     for number,day,check_in,check_out in records:
         local_in=check_in.astimezone(IRAQ_TZ)
@@ -363,6 +408,10 @@ def monthly_attendance_report(request:Request,month:str):
             "check_out":local_out.strftime("%H:%M:%S") if local_out else None,
             "late_minutes":late,"early_departure_minutes":early,"worked_seconds":worked,
             "net_worked_seconds":net_worked})
-    return {"month":month,"official_start":"08:30","official_end":"19:30","break_minutes":30,"scheduled_net_minutes":630,
+    for item in totals.values():
+        number=item["employee_number"]
+        attended={day for n,day,_,_ in records if n==number and day<=report_end and day not in holiday_dates}
+        item["days_absent"]=max(0,expected_days-len(attended))
+    return {"holidays":[{"date":str(day),"title":title} for day,title in holidays],"month":month,"official_start":"08:30","official_end":"19:30","break_minutes":30,"scheduled_net_minutes":630,
         "summary":list(totals.values()),"details":details,
-        "note":"Only recorded attendance is counted; absence, holidays and approved leave are not classified. Net time deducts up to 30 minutes per completed attendance record."}
+        "note":"Only recorded attendance is counted; Absence excludes registered holidays and today/future dates, but does not yet exclude approved leave or pre-employment dates. Net time deducts up to 30 minutes per completed attendance record."}
