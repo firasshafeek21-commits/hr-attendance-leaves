@@ -369,7 +369,29 @@ def list_employee_start_dates(request:Request):
     with db() as conn:
         rows=conn.execute("""SELECT e.employee_number,e.full_name,s.start_date
             FROM employees e LEFT JOIN hr_employee_start_dates s ON s.employee_number=e.employee_number
-            WHERE e.employee_number ~ '^[0-9]+
+            WHERE e.employee_number ~ '^[0-9]+$' ORDER BY e.employee_number""").fetchall()
+    return {"employees":[{"employee_number":r[0],"name":r[1],
+        "start_date":str(r[2]) if r[2] else None} for r in rows]}
+
+@router.put("/employees/start-date")
+def set_employee_start_date(data:EmployeeStartDate,request:Request):
+    session_user(request,{"admin","accountant"})
+    from datetime import date
+    try:
+        day=date.fromisoformat(data.start_date)
+        if day.isoformat()!=data.start_date:
+            raise ValueError()
+    except ValueError:
+        raise HTTPException(422,"Invalid start date")
+    with db() as conn:
+        row=conn.execute("SELECT 1 FROM employees WHERE employee_number=%s AND employee_number ~ '^[0-9]+$'",(data.employee_number,)).fetchone()
+        if not row:
+            raise HTTPException(404,"Employee not found")
+        conn.execute("""INSERT INTO hr_employee_start_dates(employee_number,start_date) VALUES (%s,%s)
+            ON CONFLICT(employee_number) DO UPDATE SET start_date=EXCLUDED.start_date""",(data.employee_number,day))
+    return {"ok":True}
+
+@router.get("/attendance/monthly-report")
 def monthly_attendance_report(request:Request,month:str):
     session_user(request,{"admin","manager","accountant"})
     from datetime import date
