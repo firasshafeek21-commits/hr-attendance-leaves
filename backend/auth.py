@@ -452,7 +452,7 @@ def monthly_attendance_report(request:Request,month:str):
 
 @router.put("/employees/start-date")
 def set_employee_start_date(data:EmployeeStartDate,request:Request):
-    session_user(request,{"admin"})
+    session_user(request,{"admin","accountant"})
     from datetime import date
     try:
         day=date.fromisoformat(data.start_date)
