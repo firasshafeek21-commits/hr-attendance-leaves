@@ -325,9 +325,36 @@ def change_own_password(data:ChangeOwnPassword,request:Request):
 
 IRAQ_TZ=ZoneInfo("Asia/Baghdad")
 
+# Initial worksite. Future sites can be stored in a dedicated worksite table.
+WORKSITE_LAT=30.329169970933112
+WORKSITE_LON=47.71965250416955
+WORKSITE_RADIUS_M=200.0
+
+class AttendanceLocation(BaseModel):
+    latitude: float = Field(ge=-90,le=90)
+    longitude: float = Field(ge=-180,le=180)
+    accuracy: float = Field(ge=0,le=100000)
+
+def verify_attendance_location(data:AttendanceLocation):
+    from math import radians,sin,cos,atan2,sqrt
+    if data.accuracy > 100:
+        raise HTTPException(422,"GPS accuracy is too low. Move outdoors and try again.")
+    lat1,lon1,lat2,lon2=map(radians,(WORKSITE_LAT,WORKSITE_LON,data.latitude,data.longitude))
+    a=sin((lat2-lat1)/2)**2+cos(lat1)*cos(lat2)*sin((lon2-lon1)/2)**2
+    distance=6371000*2*atan2(sqrt(a),sqrt(max(0,1-a)))
+    if distance+data.accuracy>WORKSITE_RADIUS_M:
+        raise HTTPException(403,"Outside the permitted worksite area (200 m), or location accuracy is insufficient.")
+    return round(distance)
+
+@router.get("/attendance/worksite")
+def attendance_worksite(request:Request):
+    session_user(request,{"employee","manager","accountant","admin"})
+    return {"latitude":WORKSITE_LAT,"longitude":WORKSITE_LON,"radius_m":WORKSITE_RADIUS_M}
+
 @router.post("/attendance/check-in")
-def attendance_check_in(request:Request):
+def attendance_check_in(data:AttendanceLocation,request:Request):
     user=session_user(request,{"employee"})
+    verify_attendance_location(data)
     now=datetime.now(timezone.utc)
     today=now.astimezone(IRAQ_TZ).date()
     with db() as conn:
@@ -340,8 +367,9 @@ def attendance_check_in(request:Request):
     return {"ok":True}
 
 @router.post("/attendance/check-out")
-def attendance_check_out(request:Request):
+def attendance_check_out(data:AttendanceLocation,request:Request):
     user=session_user(request,{"employee"})
+    verify_attendance_location(data)
     now=datetime.now(timezone.utc)
     today=now.astimezone(IRAQ_TZ).date()
     with db() as conn:
