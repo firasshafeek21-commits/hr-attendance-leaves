@@ -68,7 +68,7 @@ $('payrollPreviewButton').onclick=async()=>{
         edit.onclick=async()=>{
           const value=prompt('مبلغ الاستقطاع النهائي بالدينار العراقي للموظف '+s.name, String(s.effective_total_deduction));
           if(value===null)return;
-          if(!/^\\d+$/.test(value.trim())||!Number.isSafeInteger(Number(value))||Number(value)>1000000000000){feedback.textContent='أدخل مبلغاً صحيحاً';return}
+          if(!/^[0-9]+$/.test(value.trim())||!Number.isSafeInteger(Number(value))||Number(value)>1000000000000){feedback.textContent='أدخل مبلغاً صحيحاً';return}
           const reason=prompt('سبب تعديل الاستقطاع (إلزامي)',s.adjustment_reason||'');
           if(reason===null)return;
           if(reason.trim().length<3){feedback.textContent='يجب إدخال سبب التعديل (3 أحرف على الأقل)';return}
@@ -114,7 +114,7 @@ async function loadSalaries(){
         const button=document.createElement('button');button.type='button';button.textContent='حفظ';
         button.onclick=async()=>{
           const value=input.value.trim();
-          if(!/^\\d+$/.test(value)||!Number.isSafeInteger(Number(value))||Number(value)>1000000000000){
+          if(!/^[0-9]+$/.test(value)||!Number.isSafeInteger(Number(value))||Number(value)>1000000000000){
             feedback.textContent='أدخل راتباً صحيحاً بالدينار العراقي';return;
           }
           button.disabled=true;
