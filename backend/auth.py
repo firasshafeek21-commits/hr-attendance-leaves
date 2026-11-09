@@ -91,6 +91,25 @@ def init_db():
                 changed_by BIGINT NOT NULL REFERENCES hr_users(id),
                 changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS hr_payroll_approvals (
+                month TEXT NOT NULL,
+                employee_number TEXT NOT NULL REFERENCES employees(employee_number),
+                base_salary BIGINT NOT NULL,
+                total_deduction BIGINT NOT NULL,
+                net_salary BIGINT NOT NULL,
+                approved_by BIGINT NOT NULL REFERENCES hr_users(id),
+                approved_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY(month,employee_number)
+            )""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS hr_payroll_approval_history (
+                id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                month TEXT NOT NULL,
+                employee_number TEXT NOT NULL REFERENCES employees(employee_number),
+                action TEXT NOT NULL CHECK(action IN ('approve','reopen')),
+                reason TEXT,
+                performed_by BIGINT NOT NULL REFERENCES hr_users(id),
+                performed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )""")
             cur.execute("ALTER TABLE hr_users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT FALSE")
             email=os.getenv("HR_BOOTSTRAP_EMAIL","").strip().lower()
             password=os.getenv("HR_BOOTSTRAP_PASSWORD","")
@@ -527,6 +546,7 @@ def payroll_preview(request:Request,month:str):
     with db() as conn:
         salaries=dict(conn.execute("SELECT employee_number,base_salary FROM hr_employee_salaries").fetchall())
         adjustments={n:(a,reason) for n,a,reason in conn.execute("SELECT employee_number,adjusted_deduction,reason FROM hr_payroll_adjustments WHERE month=%s",(month,)).fetchall()}
+        approvals={n:(salary,deduction,net) for n,salary,deduction,net in conn.execute("SELECT employee_number,base_salary,total_deduction,net_salary FROM hr_payroll_approvals WHERE month=%s",(month,)).fetchall()}
     def round_iqd(amount):
         return int(amount.quantize(Decimal("1"),rounding=ROUND_HALF_UP))
     rows=[]
@@ -549,17 +569,86 @@ def payroll_preview(request:Request,month:str):
         adjustment=adjustments.get(item["employee_number"]) if not missing else None
         effective_total=adjustment[0] if adjustment else total
         effective_net=salary-effective_total if not missing else None
+        approved=approvals.get(item["employee_number"])
         rows.append({"employee_number":item["employee_number"],"name":item["name"],
-            "base_salary":salary,"start_date":item["start_date"],"days_absent":absent,
+            "base_salary":approved[0] if approved else salary,"start_date":item["start_date"],"days_absent":absent,
             "late_minutes":late,"early_departure_minutes":early,
             "absence_deduction":absence_deduction,"late_deduction":late_deduction,
             "early_deduction":early_deduction,"total_deduction":total,
-            "estimated_net_salary":effective_net,"adjusted_deduction":adjustment[0] if adjustment else None,
+            "estimated_net_salary":approved[2] if approved else effective_net,"adjusted_deduction":adjustment[0] if adjustment else None,
             "adjustment_reason":adjustment[1] if adjustment else None,
-            "effective_total_deduction":effective_total,
-            "status":"incomplete" if missing else "preview"})
+            "effective_total_deduction":approved[1] if approved else effective_total,
+            "approved":approved is not None,
+            "status":"approved" if approved else ("incomplete" if missing else "preview")})
     return {"month":month,"rows":rows,"provisional":True,
         "note":"Preview only, not approved. Missing base salary or employment start date prevents calculation. Approved leave is excluded from absence in the attendance report. Unpaid leave needs a separate payroll policy. Current month excludes today and future dates. No edits or approvals are saved."}
+
+class PayrollApprovalInput(BaseModel):
+    month: str
+    employee_number: str | None = None
+    reason: str | None = None
+
+def validate_payroll_month(month):
+    from datetime import date
+    try:
+        if len(month)!=7 or date.fromisoformat(month+"-01").strftime("%Y-%m")!=month:
+            raise ValueError()
+    except ValueError:
+        raise HTTPException(422,"Invalid month")
+
+@router.post("/payroll/approve")
+def approve_payroll(data:PayrollApprovalInput,request:Request):
+    user=session_user(request,{"admin","manager","accountant"})
+    validate_payroll_month(data.month)
+    preview=payroll_preview(request,data.month)
+    rows=[r for r in preview["rows"] if data.employee_number is None or r["employee_number"]==data.employee_number]
+    if not rows:
+        raise HTTPException(404,"Employee not found")
+    if data.employee_number is not None and rows[0]["status"]=="incomplete":
+        raise HTTPException(422,"Employee payroll data incomplete")
+    eligible=[r for r in rows if r["status"]=="preview"]
+    with db() as conn:
+        with conn.transaction():
+            for row in eligible:
+                result=conn.execute("""INSERT INTO hr_payroll_approvals
+                    (month,employee_number,base_salary,total_deduction,net_salary,approved_by)
+                    VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING RETURNING employee_number""",
+                    (data.month,row["employee_number"],row["base_salary"],row["effective_total_deduction"],row["estimated_net_salary"],user["id"])).fetchone()
+                if result:
+                    conn.execute("""INSERT INTO hr_payroll_approval_history
+                        (month,employee_number,action,performed_by) VALUES (%s,%s,'approve',%s)""",
+                        (data.month,row["employee_number"],user["id"]))
+    return {"ok":True,"approved_count":len(eligible),"skipped_incomplete":sum(r["status"]=="incomplete" for r in rows)}
+
+@router.post("/payroll/reopen")
+def reopen_payroll(data:PayrollApprovalInput,request:Request):
+    user=session_user(request,{"admin","manager","accountant"})
+    validate_payroll_month(data.month)
+    reason=(data.reason or "").strip()
+    if len(reason)<3:
+        raise HTTPException(422,"Reopening reason is required")
+    with db() as conn:
+        with conn.transaction():
+            if data.employee_number is not None:
+                existing=conn.execute("""DELETE FROM hr_payroll_approvals WHERE month=%s AND employee_number=%s RETURNING employee_number""",
+                    (data.month,data.employee_number)).fetchall()
+            else:
+                existing=conn.execute("DELETE FROM hr_payroll_approvals WHERE month=%s RETURNING employee_number",(data.month,)).fetchall()
+            for (number,) in existing:
+                conn.execute("""INSERT INTO hr_payroll_approval_history
+                    (month,employee_number,action,reason,performed_by) VALUES (%s,%s,'reopen',%s,%s)""",
+                    (data.month,number,reason,user["id"]))
+    return {"ok":True,"reopened_count":len(existing)}
+
+@router.get("/payroll/approval-history")
+def payroll_approval_history(request:Request,month:str):
+    session_user(request,{"admin","manager","accountant"})
+    validate_payroll_month(month)
+    with db() as conn:
+        rows=conn.execute("""SELECT h.employee_number,e.full_name,h.action,h.reason,u.email,h.performed_at
+            FROM hr_payroll_approval_history h JOIN employees e ON e.employee_number=h.employee_number
+            JOIN hr_users u ON u.id=h.performed_by WHERE h.month=%s ORDER BY h.id DESC LIMIT 200""",(month,)).fetchall()
+    return {"history":[{"employee_number":r[0],"name":r[1],"action":r[2],"reason":r[3],"user":r[4],"at":r[5].isoformat()} for r in rows]}
 
 class PayrollAdjustmentInput(BaseModel):
     month: str
@@ -581,6 +670,9 @@ def set_payroll_adjustment(data:PayrollAdjustmentInput,request:Request):
         raise HTTPException(422,"Adjustment reason is required")
     with db() as conn:
         with conn.transaction():
+            locked=conn.execute("SELECT 1 FROM hr_payroll_approvals WHERE month=%s AND employee_number=%s",(data.month,data.employee_number)).fetchone()
+            if locked:
+                raise HTTPException(409,"Approved payroll is locked; reopen it first")
             exists=conn.execute("""SELECT 1 FROM hr_employee_salaries s
                 JOIN hr_employee_start_dates d ON d.employee_number=s.employee_number
                 WHERE s.employee_number=%s""",(data.employee_number,)).fetchone()
