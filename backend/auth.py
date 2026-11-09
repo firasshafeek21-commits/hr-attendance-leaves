@@ -73,6 +73,16 @@ def init_db():
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 UNIQUE(employee_number,work_date)
             )""")
+            cur.execute("ALTER TABLE hr_early_exit_alerts ADD COLUMN IF NOT EXISTS decision TEXT")
+            cur.execute("ALTER TABLE hr_early_exit_alerts ADD COLUMN IF NOT EXISTS decision_note TEXT NOT NULL DEFAULT ''")
+            cur.execute("""CREATE TABLE IF NOT EXISTS hr_early_exit_decision_history (
+                id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                alert_id BIGINT NOT NULL REFERENCES hr_early_exit_alerts(id),
+                decision TEXT NOT NULL,
+                note TEXT NOT NULL DEFAULT '',
+                decided_by BIGINT NOT NULL REFERENCES hr_users(id),
+                decided_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )""")
             cur.execute("""CREATE TABLE IF NOT EXISTS hr_holidays (\n                id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,\n                holiday_date DATE NOT NULL UNIQUE,\n                title TEXT NOT NULL,\n                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()\n            )""")
             cur.execute("""CREATE TABLE IF NOT EXISTS hr_employee_start_dates (
                 employee_number TEXT PRIMARY KEY REFERENCES employees(employee_number),
@@ -416,21 +426,49 @@ def early_exit_alerts(request:Request):
     with db() as conn:
         rows=conn.execute("""SELECT a.id,a.employee_number,e.full_name,a.work_date,a.checked_out_at,
             a.status,EXISTS(SELECT 1 FROM hr_leaves l WHERE l.employee_number=a.employee_number
-                AND l.status='approved' AND a.work_date BETWEEN l.starts AND l.ends)
+                AND l.status='approved' AND a.work_date BETWEEN l.starts AND l.ends),
+            a.decision,a.decision_note
             FROM hr_early_exit_alerts a JOIN employees e ON e.employee_number=a.employee_number
             ORDER BY a.created_at DESC LIMIT 200""").fetchall()
     return {"alerts":[{"id":r[0],"employee_number":r[1],"name":r[2],
         "date":str(r[3]),"checkout":r[4].astimezone(IRAQ_TZ).strftime("%H:%M:%S"),
-        "status":r[5],"approved_leave":r[6]} for r in rows]}
+        "status":r[5],"approved_leave":r[6],"decision":r[7],"note":r[8]} for r in rows]}
+
+class EarlyExitDecision(BaseModel):
+    decision: str
+    note: str = Field(default="",max_length=1000)
+
+@router.post("/attendance/early-exit-alerts/{alert_id}/decision")
+def decide_early_exit(alert_id:int,data:EarlyExitDecision,request:Request):
+    user=session_user(request,{"admin","manager"})
+    allowed={"approved_exit","ignore","unauthorized","leave_requested","follow_up"}
+    if data.decision not in allowed:
+        raise HTTPException(422,"Invalid early exit decision")
+    note=data.note.strip()
+    if data.decision in {"unauthorized","leave_requested"} and not note:
+        raise HTTPException(422,"Please enter a reason or note for this decision")
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""UPDATE hr_early_exit_alerts SET decision=%s,decision_note=%s,
+                status=%s,reviewed_by=%s,reviewed_at=NOW() WHERE id=%s RETURNING id""",
+                (data.decision,note,"pending" if data.decision=="follow_up" else "reviewed",user["id"],alert_id))
+            if not cur.fetchone():
+                raise HTTPException(404,"Alert not found")
+            cur.execute("""INSERT INTO hr_early_exit_decision_history(alert_id,decision,note,decided_by)
+                VALUES (%s,%s,%s,%s)""",(alert_id,data.decision,note,user["id"]))
+    return {"ok":True}
 
 @router.post("/attendance/early-exit-alerts/{alert_id}/review")
 def review_early_exit_alert(alert_id:int,request:Request):
     user=session_user(request,{"admin","manager"})
     with db() as conn:
         row=conn.execute("""UPDATE hr_early_exit_alerts SET status='reviewed',
-            reviewed_by=%s,reviewed_at=NOW() WHERE id=%s AND status='pending' RETURNING id""",
+            decision='ignore',reviewed_by=%s,reviewed_at=NOW()
+            WHERE id=%s AND status='pending' RETURNING id""",
             (user["id"],alert_id)).fetchone()
         if not row: raise HTTPException(404,"Pending alert not found")
+        conn.execute("""INSERT INTO hr_early_exit_decision_history(alert_id,decision,note,decided_by)
+            VALUES (%s,'ignore','',%s)""",(alert_id,user["id"]))
     return {"ok":True}
 
 @router.get("/attendance")
