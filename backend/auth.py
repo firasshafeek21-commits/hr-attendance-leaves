@@ -110,6 +110,13 @@ def init_db():
                 performed_by BIGINT NOT NULL REFERENCES hr_users(id),
                 performed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS hr_report_settings (
+                id INTEGER PRIMARY KEY CHECK(id=1),
+                company_name TEXT NOT NULL DEFAULT '',
+                report_title TEXT NOT NULL DEFAULT 'كشف الرواتب الشهري',
+                updated_by BIGINT REFERENCES hr_users(id),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )""")
             cur.execute("ALTER TABLE hr_users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT FALSE")
             email=os.getenv("HR_BOOTSTRAP_EMAIL","").strip().lower()
             password=os.getenv("HR_BOOTSTRAP_PASSWORD","")
@@ -583,6 +590,31 @@ def payroll_preview(request:Request,month:str):
     return {"month":month,"rows":rows,"provisional":True,
         "note":"Preview only, not approved. Missing base salary or employment start date prevents calculation. Approved leave is excluded from absence in the attendance report. Unpaid leave needs a separate payroll policy. Current month excludes today and future dates. No edits or approvals are saved."}
 
+class ReportSettingsInput(BaseModel):
+    company_name: str = Field(max_length=200)
+    report_title: str = Field(max_length=200)
+
+@router.get("/report-settings")
+def get_report_settings(request:Request):
+    session_user(request,{"admin","manager","accountant"})
+    with db() as conn:
+        row=conn.execute("SELECT company_name,report_title FROM hr_report_settings WHERE id=1").fetchone()
+    return {"company_name":row[0] if row else "", "report_title":row[1] if row else "كشف الرواتب الشهري"}
+
+@router.put("/report-settings")
+def save_report_settings(data:ReportSettingsInput,request:Request):
+    user=session_user(request,{"admin"})
+    company=data.company_name.strip()
+    title=data.report_title.strip()
+    if not title:
+        raise HTTPException(422,"Report title is required")
+    with db() as conn:
+        conn.execute("""INSERT INTO hr_report_settings(id,company_name,report_title,updated_by)
+            VALUES (1,%s,%s,%s) ON CONFLICT(id) DO UPDATE SET
+            company_name=EXCLUDED.company_name,report_title=EXCLUDED.report_title,
+            updated_by=EXCLUDED.updated_by,updated_at=NOW()""",(company,title,user["id"]))
+    return {"ok":True}
+
 @router.get("/payroll/export.xlsx")
 def export_payroll_excel(request:Request,month:str):
     session_user(request,{"admin","manager","accountant"})
@@ -593,11 +625,12 @@ def export_payroll_excel(request:Request,month:str):
     from openpyxl.styles import Font, PatternFill, Alignment
     from openpyxl.utils import get_column_letter
     data=payroll_preview(request,month)
+    settings=get_report_settings(request)
     wb=Workbook()
     ws=wb.active
     ws.title="كشف الرواتب"
     ws.sheet_view.rightToLeft=True
-    ws.append(["كشف الرواتب الشهري",month])
+    ws.append([settings["company_name"],settings["report_title"],month])
     headers=["رقم الموظف","اسم الموظف","تاريخ المباشرة","الراتب الأساسي","أيام الغياب",
              "دقائق التأخير","دقائق الخروج المبكر","استقطاع الغياب","استقطاع التأخير",
              "استقطاع الخروج المبكر","الاستقطاع التلقائي","الاستقطاع النهائي",
