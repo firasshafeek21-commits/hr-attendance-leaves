@@ -111,20 +111,21 @@ async function loadSalaries(){
       salaryCell.append(input);
       const action=document.createElement('td');
       if(canEdit){
+        const rowStatus=document.createElement('span');rowStatus.setAttribute('role','status');rowStatus.style.marginInlineStart='10px';rowStatus.style.fontSize='12px';
         const button=document.createElement('button');button.type='button';button.textContent='حفظ';
         button.onclick=async()=>{
           const value=input.value.trim();
           if(!/^[0-9]+$/.test(value)||!Number.isSafeInteger(Number(value))||Number(value)>1000000000000){
-            feedback.textContent='أدخل راتباً صحيحاً بالدينار العراقي';return;
+            rowStatus.textContent='أدخل راتباً صحيحاً';rowStatus.style.color='#b91c1c';return;
           }
-          button.disabled=true;
+          button.disabled=true;rowStatus.textContent='جاري الحفظ...';rowStatus.style.color='inherit';
           try{
             await api('/payroll/base-salary',{method:'PUT',body:JSON.stringify({employee_number:employee.employee_number,base_salary:Number(value)})});
-            feedback.textContent='تم حفظ راتب '+employee.name+' بنجاح';
-          }catch(err){feedback.textContent='تعذر الحفظ: '+err.message}
+            rowStatus.textContent='تم الحفظ بنجاح ✓';rowStatus.style.color='#15803d';
+          }catch(err){rowStatus.textContent='تعذر الحفظ: '+err.message;rowStatus.style.color='#b91c1c'}
           finally{button.disabled=false}
         };
-        action.append(button);
+        action.append(button,rowStatus);
       }else{action.textContent='عرض فقط'}
       tr.append(td(employee.employee_number),td(employee.name),salaryCell,action);table.append(tr);
     }
