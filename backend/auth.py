@@ -74,7 +74,24 @@ def init_db():
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )""")
             cur.execute("""CREATE TABLE IF NOT EXISTS hr_payroll_adjustments (
-                month TEXT NOT NULL CHECK (month ~ '^[0-9]{4}-[0-9]{2}
+                month TEXT NOT NULL,
+                employee_number TEXT NOT NULL REFERENCES employees(employee_number),
+                adjusted_deduction BIGINT NOT NULL CHECK (adjusted_deduction >= 0),
+                reason TEXT NOT NULL CHECK (length(trim(reason)) >= 3),
+                updated_by BIGINT NOT NULL REFERENCES hr_users(id),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY(month,employee_number)
+            )""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS hr_payroll_adjustment_history (
+                id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                month TEXT NOT NULL,
+                employee_number TEXT NOT NULL REFERENCES employees(employee_number),
+                adjusted_deduction BIGINT NOT NULL,
+                reason TEXT NOT NULL,
+                changed_by BIGINT NOT NULL REFERENCES hr_users(id),
+                changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )""")
+            cur.execute("ALTER TABLE hr_users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT FALSE")
             email=os.getenv("HR_BOOTSTRAP_EMAIL","").strip().lower()
             password=os.getenv("HR_BOOTSTRAP_PASSWORD","")
             if email and password:
