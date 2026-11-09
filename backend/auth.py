@@ -67,6 +67,12 @@ def init_db():
                 employee_number TEXT PRIMARY KEY REFERENCES employees(employee_number),
                 start_date DATE NOT NULL
             )""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS hr_employee_salaries (
+                employee_number TEXT PRIMARY KEY REFERENCES employees(employee_number),
+                base_salary BIGINT NOT NULL CHECK (base_salary >= 0),
+                updated_by BIGINT REFERENCES hr_users(id),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )""")
             cur.execute("ALTER TABLE hr_users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT FALSE")
             email=os.getenv("HR_BOOTSTRAP_EMAIL","").strip().lower()
             password=os.getenv("HR_BOOTSTRAP_PASSWORD","")
@@ -468,3 +474,29 @@ def monthly_attendance_report(request:Request,month:str):
     return {"holidays":[{"date":str(day),"title":title} for day,title in holidays],"month":month,"official_start":"08:30","official_end":"19:30","break_minutes":30,"scheduled_net_minutes":630,
         "summary":list(totals.values()),"details":details,
         "note":"Only recorded attendance is counted; Absence excludes registered holidays and today/future dates, and approved leave, and dates before employment start; absence remains uncalculated when start date is missing. Net time deducts up to 30 minutes per completed attendance record."}
+
+class EmployeeSalaryInput(BaseModel):
+    employee_number: str
+    base_salary: int = Field(ge=0, le=1000000000000)
+
+@router.get("/payroll/base-salaries")
+def list_base_salaries(request:Request):
+    session_user(request,{"admin","manager","accountant"})
+    with db() as conn:
+        rows=conn.execute("""SELECT e.employee_number,e.full_name,s.base_salary
+            FROM employees e LEFT JOIN hr_employee_salaries s ON s.employee_number=e.employee_number
+            WHERE e.employee_number ~ '^[0-9]+$' ORDER BY e.employee_number""").fetchall()
+    return {"employees":[{"employee_number":r[0],"name":r[1],"base_salary":r[2]} for r in rows]}
+
+@router.put("/payroll/base-salary")
+def set_base_salary(data:EmployeeSalaryInput,request:Request):
+    user=session_user(request,{"admin","accountant"})
+    with db() as conn:
+        exists=conn.execute("SELECT 1 FROM employees WHERE employee_number=%s AND employee_number ~ '^[0-9]+$'",(data.employee_number,)).fetchone()
+        if not exists:
+            raise HTTPException(404,"Employee not found")
+        conn.execute("""INSERT INTO hr_employee_salaries(employee_number,base_salary,updated_by)
+            VALUES (%s,%s,%s) ON CONFLICT(employee_number) DO UPDATE SET
+            base_salary=EXCLUDED.base_salary,updated_by=EXCLUDED.updated_by,updated_at=NOW()""",
+            (data.employee_number,data.base_salary,user["id"]))
+    return {"ok":True}
