@@ -328,7 +328,7 @@ IRAQ_TZ=ZoneInfo("Asia/Baghdad")
 # Initial worksite. Future sites can be stored in a dedicated worksite table.
 WORKSITE_LAT=30.517371809331323
 WORKSITE_LON=47.833102509242806
-WORKSITE_RADIUS_M=200.0
+WORKSITE_RADIUS_M=100.0
 
 class AttendanceLocation(BaseModel):
     latitude: float = Field(ge=-90,le=90)
@@ -343,7 +343,7 @@ def verify_attendance_location(data:AttendanceLocation):
     a=sin((lat2-lat1)/2)**2+cos(lat1)*cos(lat2)*sin((lon2-lon1)/2)**2
     distance=6371000*2*atan2(sqrt(a),sqrt(max(0,1-a)))
     if distance+data.accuracy>WORKSITE_RADIUS_M:
-        raise HTTPException(403,"Outside the permitted worksite area (200 m), or location accuracy is insufficient.")
+        raise HTTPException(403,"Outside the permitted worksite area (100 m), or location accuracy is insufficient.")
     return round(distance)
 
 @router.get("/attendance/worksite")
