@@ -326,8 +326,8 @@ def change_own_password(data:ChangeOwnPassword,request:Request):
 IRAQ_TZ=ZoneInfo("Asia/Baghdad")
 
 # Initial worksite. Future sites can be stored in a dedicated worksite table.
-WORKSITE_LAT=30.329169970933112
-WORKSITE_LON=47.71965250416955
+WORKSITE_LAT=30.517371809331323
+WORKSITE_LON=47.833102509242806
 WORKSITE_RADIUS_M=200.0
 
 class AttendanceLocation(BaseModel):
