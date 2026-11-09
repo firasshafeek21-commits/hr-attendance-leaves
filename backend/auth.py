@@ -583,6 +583,52 @@ def payroll_preview(request:Request,month:str):
     return {"month":month,"rows":rows,"provisional":True,
         "note":"Preview only, not approved. Missing base salary or employment start date prevents calculation. Approved leave is excluded from absence in the attendance report. Unpaid leave needs a separate payroll policy. Current month excludes today and future dates. No edits or approvals are saved."}
 
+@router.get("/payroll/export.xlsx")
+def export_payroll_excel(request:Request,month:str):
+    session_user(request,{"admin","manager","accountant"})
+    validate_payroll_month(month)
+    from io import BytesIO
+    from fastapi.responses import StreamingResponse
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+    data=payroll_preview(request,month)
+    wb=Workbook()
+    ws=wb.active
+    ws.title="كشف الرواتب"
+    ws.sheet_view.rightToLeft=True
+    ws.append(["كشف الرواتب الشهري",month])
+    headers=["رقم الموظف","اسم الموظف","تاريخ المباشرة","الراتب الأساسي","أيام الغياب",
+             "دقائق التأخير","دقائق الخروج المبكر","استقطاع الغياب","استقطاع التأخير",
+             "استقطاع الخروج المبكر","الاستقطاع التلقائي","الاستقطاع النهائي",
+             "صافي الراتب","سبب التعديل","حالة الاعتماد"]
+    ws.append(headers)
+    for row in data["rows"]:
+        ws.append([row["employee_number"],row["name"],row["start_date"],
+                   row["base_salary"],row["days_absent"],row["late_minutes"],
+                   row["early_departure_minutes"],row["absence_deduction"],
+                   row["late_deduction"],row["early_deduction"],row["total_deduction"],
+                   row["effective_total_deduction"],row["estimated_net_salary"],
+                   row["adjustment_reason"] or "",
+                   "معتمد" if row["status"]=="approved" else ("بيانات ناقصة" if row["status"]=="incomplete" else "للمراجعة")])
+    for cell in ws[2]:
+        cell.font=Font(bold=True,color="FFFFFF")
+        cell.fill=PatternFill("solid",fgColor="24466A")
+        cell.alignment=Alignment(horizontal="center")
+    for col in range(1,len(headers)+1):
+        ws.column_dimensions[get_column_letter(col)].width=25 if col in (2,14) else 19
+    ws.freeze_panes="C3"
+    ws.auto_filter.ref=f"A2:O{ws.max_row}"
+    for row in ws.iter_rows(min_row=3):
+        for cell in row:
+            if cell.column in (4,8,9,10,11,12,13) and isinstance(cell.value,int):
+                cell.number_format='#,##0'
+    output=BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return StreamingResponse(output,media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition":f'attachment; filename="payroll-{month}.xlsx"'})
+
 class PayrollApprovalInput(BaseModel):
     month: str
     employee_number: str | None = None
