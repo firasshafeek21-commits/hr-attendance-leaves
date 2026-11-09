@@ -62,6 +62,17 @@ def init_db():
                 CHECK(ends >= starts)
             )""")
             cur.execute("""CREATE TABLE IF NOT EXISTS hr_attendance (\n                id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,\n                employee_number TEXT NOT NULL REFERENCES employees(employee_number),\n                work_date DATE NOT NULL,\n                check_in TIMESTAMPTZ NOT NULL,\n                check_out TIMESTAMPTZ,\n                UNIQUE(employee_number,work_date),\n                CHECK(check_out IS NULL OR check_out >= check_in)\n            )""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS hr_early_exit_alerts (
+                id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                employee_number TEXT NOT NULL REFERENCES employees(employee_number),
+                work_date DATE NOT NULL,
+                checked_out_at TIMESTAMPTZ NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','reviewed')),
+                reviewed_by BIGINT REFERENCES hr_users(id),
+                reviewed_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE(employee_number,work_date)
+            )""")
             cur.execute("""CREATE TABLE IF NOT EXISTS hr_holidays (\n                id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,\n                holiday_date DATE NOT NULL UNIQUE,\n                title TEXT NOT NULL,\n                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()\n            )""")
             cur.execute("""CREATE TABLE IF NOT EXISTS hr_employee_start_dates (
                 employee_number TEXT PRIMARY KEY REFERENCES employees(employee_number),
@@ -379,6 +390,34 @@ def attendance_check_out(data:AttendanceLocation,request:Request):
                 RETURNING id""",(now,user["employee_number"],today))
             if not cur.fetchone():
                 raise HTTPException(409,"Check in first, or check out already recorded")
+            local_now=now.astimezone(IRAQ_TZ)
+            if (local_now.hour,local_now.minute,local_now.second)<(19,30,0):
+                cur.execute("""INSERT INTO hr_early_exit_alerts(employee_number,work_date,checked_out_at)
+                    VALUES (%s,%s,%s) ON CONFLICT(employee_number,work_date) DO NOTHING""",
+                    (user["employee_number"],today,now))
+    return {"ok":True}
+
+@router.get("/attendance/early-exit-alerts")
+def early_exit_alerts(request:Request):
+    session_user(request,{"admin","manager"})
+    with db() as conn:
+        rows=conn.execute("""SELECT a.id,a.employee_number,e.full_name,a.work_date,a.checked_out_at,
+            a.status,EXISTS(SELECT 1 FROM hr_leaves l WHERE l.employee_number=a.employee_number
+                AND l.status='approved' AND a.work_date BETWEEN l.starts AND l.ends)
+            FROM hr_early_exit_alerts a JOIN employees e ON e.employee_number=a.employee_number
+            ORDER BY a.created_at DESC LIMIT 200""").fetchall()
+    return {"alerts":[{"id":r[0],"employee_number":r[1],"name":r[2],
+        "date":str(r[3]),"checkout":r[4].astimezone(IRAQ_TZ).strftime("%H:%M:%S"),
+        "status":r[5],"approved_leave":r[6]} for r in rows]}
+
+@router.post("/attendance/early-exit-alerts/{alert_id}/review")
+def review_early_exit_alert(alert_id:int,request:Request):
+    user=session_user(request,{"admin","manager"})
+    with db() as conn:
+        row=conn.execute("""UPDATE hr_early_exit_alerts SET status='reviewed',
+            reviewed_by=%s,reviewed_at=NOW() WHERE id=%s AND status='pending' RETURNING id""",
+            (user["id"],alert_id)).fetchone()
+        if not row: raise HTTPException(404,"Pending alert not found")
     return {"ok":True}
 
 @router.get("/attendance")
