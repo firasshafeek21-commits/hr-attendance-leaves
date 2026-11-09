@@ -500,3 +500,39 @@ def set_base_salary(data:EmployeeSalaryInput,request:Request):
             base_salary=EXCLUDED.base_salary,updated_by=EXCLUDED.updated_by,updated_at=NOW()""",
             (data.employee_number,data.base_salary,user["id"]))
     return {"ok":True}
+
+@router.get("/payroll/preview")
+def payroll_preview(request:Request,month:str):
+    session_user(request,{"admin","manager","accountant"})
+    from decimal import Decimal, ROUND_HALF_UP
+    report=monthly_attendance_report(request,month)
+    with db() as conn:
+        salaries=dict(conn.execute("SELECT employee_number,base_salary FROM hr_employee_salaries").fetchall())
+    def round_iqd(amount):
+        return int(amount.quantize(Decimal("1"),rounding=ROUND_HALF_UP))
+    rows=[]
+    for item in report["summary"]:
+        salary=salaries.get(item["employee_number"])
+        absent=item["days_absent"]
+        late=item["late_minutes"]
+        early=item["early_departure_minutes"]
+        missing=salary is None or absent is None
+        if not missing:
+            daily=Decimal(salary)/Decimal(30)
+            minute=Decimal(salary)/Decimal(30*630)
+            absence_deduction=round_iqd(daily*absent)
+            late_deduction=round_iqd(minute*late)
+            early_deduction=round_iqd(minute*early)
+            total=absence_deduction+late_deduction+early_deduction
+            net=salary-total
+        else:
+            absence_deduction=late_deduction=early_deduction=total=net=None
+        rows.append({"employee_number":item["employee_number"],"name":item["name"],
+            "base_salary":salary,"start_date":item["start_date"],"days_absent":absent,
+            "late_minutes":late,"early_departure_minutes":early,
+            "absence_deduction":absence_deduction,"late_deduction":late_deduction,
+            "early_deduction":early_deduction,"total_deduction":total,
+            "estimated_net_salary":net,
+            "status":"incomplete" if missing else "preview"})
+    return {"month":month,"rows":rows,"provisional":True,
+        "note":"Preview only, not approved. Missing base salary or employment start date prevents calculation. Approved leave is excluded from absence in the attendance report. Unpaid leave needs a separate payroll policy. Current month excludes today and future dates. No edits or approvals are saved."}
