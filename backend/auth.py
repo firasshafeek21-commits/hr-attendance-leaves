@@ -569,7 +569,7 @@ class PayrollAdjustmentInput(BaseModel):
 
 @router.put("/payroll/adjustment")
 def set_payroll_adjustment(data:PayrollAdjustmentInput,request:Request):
-    user=session_user(request,{"accountant"})
+    user=session_user(request,{"admin","accountant"})
     from datetime import date
     try:
         if len(data.month)!=7 or date.fromisoformat(data.month+"-01").strftime("%Y-%m")!=data.month:
