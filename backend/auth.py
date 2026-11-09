@@ -397,6 +397,19 @@ def attendance_check_out(data:AttendanceLocation,request:Request):
                     (user["employee_number"],today,now))
     return {"ok":True}
 
+@router.post("/attendance/early-exit-alerts/backfill")
+def backfill_early_exit_alerts(request:Request):
+    session_user(request,{"admin"})
+    with db() as conn:
+        rows=conn.execute("""INSERT INTO hr_early_exit_alerts(employee_number,work_date,checked_out_at)
+            SELECT a.employee_number,a.work_date,a.check_out
+            FROM hr_attendance a
+            WHERE a.check_out IS NOT NULL
+              AND (a.check_out AT TIME ZONE 'Asia/Baghdad')::time < TIME '19:30:00'
+            ON CONFLICT(employee_number,work_date) DO NOTHING
+            RETURNING id""").fetchall()
+    return {"ok":True,"created":len(rows)}
+
 @router.get("/attendance/early-exit-alerts")
 def early_exit_alerts(request:Request):
     session_user(request,{"admin","manager"})
