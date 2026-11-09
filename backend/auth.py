@@ -603,7 +603,7 @@ def get_report_settings(request:Request):
 
 @router.put("/report-settings")
 def save_report_settings(data:ReportSettingsInput,request:Request):
-    user=session_user(request,{"admin"})
+    user=session_user(request,{"admin","accountant"})
     company=data.company_name.strip()
     title=data.report_title.strip()
     if not title:
