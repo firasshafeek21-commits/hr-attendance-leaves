@@ -672,6 +672,23 @@ def payroll_preview(request:Request,month:str):
         salaries=dict(conn.execute("SELECT employee_number,base_salary FROM hr_employee_salaries").fetchall())
         adjustments={n:(a,reason) for n,a,reason in conn.execute("SELECT employee_number,adjusted_deduction,reason FROM hr_payroll_adjustments WHERE month=%s",(month,)).fetchall()}
         approvals={n:(salary,deduction,net) for n,salary,deduction,net in conn.execute("SELECT employee_number,base_salary,total_deduction,net_salary FROM hr_payroll_approvals WHERE month=%s",(month,)).fetchall()}
+        from datetime import date
+        import calendar
+        month_start=date(int(month[:4]),int(month[5:]),1)
+        month_end=date(int(month[:4]),int(month[5:]),calendar.monthrange(int(month[:4]),int(month[5:]))[1])
+        cutoff=min(month_end,datetime.now(IRAQ_TZ).date()-timedelta(days=1))
+        unpaid_rows=conn.execute("""SELECT employee_number,starts,ends FROM hr_leaves
+            WHERE status='approved' AND kind='بدون راتب' AND starts<=%s AND ends>=%s""",
+            (month_end,month_start)).fetchall()
+        holidays={row[0] for row in conn.execute("SELECT holiday_date FROM hr_holidays WHERE holiday_date BETWEEN %s AND %s",(month_start,month_end)).fetchall()}
+        start_dates=dict(conn.execute("SELECT employee_number,start_date FROM hr_employee_start_dates").fetchall())
+    unpaid_days={}
+    for employee_number,leave_start,leave_end in unpaid_rows:
+        first=max(month_start,leave_start,start_dates.get(employee_number,month_start))
+        last=min(cutoff,leave_end)
+        if first<=last:
+            days=unpaid_days.setdefault(employee_number,set())
+            days.update(first+timedelta(days=i) for i in range((last-first).days+1) if first+timedelta(days=i) not in holidays)
     def round_iqd(amount):
         return int(amount.quantize(Decimal("1"),rounding=ROUND_HALF_UP))
     rows=[]
@@ -687,10 +704,13 @@ def payroll_preview(request:Request,month:str):
             absence_deduction=round_iqd(daily*absent)
             late_deduction=round_iqd(minute*late)
             early_deduction=round_iqd(minute*early)
-            total=absence_deduction+late_deduction+early_deduction
+            unpaid_leave_days=len(unpaid_days.get(item["employee_number"],set()))
+            unpaid_leave_deduction=round_iqd(daily*unpaid_leave_days)
+            total=absence_deduction+late_deduction+early_deduction+unpaid_leave_deduction
             net=salary-total
         else:
-            absence_deduction=late_deduction=early_deduction=total=net=None
+            absence_deduction=late_deduction=early_deduction=unpaid_leave_deduction=total=net=None
+            unpaid_leave_days=len(unpaid_days.get(item["employee_number"],set()))
         adjustment=adjustments.get(item["employee_number"]) if not missing else None
         effective_total=adjustment[0] if adjustment else total
         effective_net=salary-effective_total if not missing else None
@@ -698,6 +718,7 @@ def payroll_preview(request:Request,month:str):
         rows.append({"employee_number":item["employee_number"],"name":item["name"],
             "base_salary":approved[0] if approved else salary,"start_date":item["start_date"],"days_absent":absent,
             "late_minutes":late,"early_departure_minutes":early,
+            "unpaid_leave_days":unpaid_leave_days,"unpaid_leave_deduction":unpaid_leave_deduction,
             "absence_deduction":absence_deduction,"late_deduction":late_deduction,
             "early_deduction":early_deduction,"total_deduction":total,
             "estimated_net_salary":approved[2] if approved else effective_net,"adjusted_deduction":adjustment[0] if adjustment else None,
@@ -706,7 +727,7 @@ def payroll_preview(request:Request,month:str):
             "approved":approved is not None,
             "status":"approved" if approved else ("incomplete" if missing else "preview")})
     return {"month":month,"rows":rows,"provisional":True,
-        "note":"Preview only, not approved. Missing base salary or employment start date prevents calculation. Approved leave is excluded from absence in the attendance report. Unpaid leave needs a separate payroll policy. Current month excludes today and future dates. No edits or approvals are saved."}
+        "note":"Preview only, not approved. Missing base salary or employment start date prevents calculation. Approved leave is excluded from absence in the attendance report. Approved unpaid leave is deducted at base salary / 30 per eligible day, excluding holidays and today/future dates. Current month excludes today and future dates. No edits or approvals are saved."}
 
 class ReportSettingsInput(BaseModel):
     company_name: str = Field(max_length=200)
@@ -750,13 +771,14 @@ def export_payroll_excel(request:Request,month:str):
     ws.sheet_view.rightToLeft=True
     ws.append([settings["company_name"],settings["report_title"],month])
     headers=["رقم الموظف","اسم الموظف","تاريخ المباشرة","الراتب الأساسي","أيام الغياب",
+             "أيام إجازة بدون راتب","استقطاع إجازة بدون راتب",
              "دقائق التأخير","دقائق الخروج المبكر","استقطاع الغياب","استقطاع التأخير",
              "استقطاع الخروج المبكر","الاستقطاع التلقائي","الاستقطاع النهائي",
              "صافي الراتب","سبب التعديل","حالة الاعتماد"]
     ws.append(headers)
     for row in data["rows"]:
         ws.append([row["employee_number"],row["name"],row["start_date"],
-                   row["base_salary"],row["days_absent"],row["late_minutes"],
+                   row["base_salary"],row["days_absent"],row["unpaid_leave_days"],row["unpaid_leave_deduction"],row["late_minutes"],
                    row["early_departure_minutes"],row["absence_deduction"],
                    row["late_deduction"],row["early_deduction"],row["total_deduction"],
                    row["effective_total_deduction"],row["estimated_net_salary"],
